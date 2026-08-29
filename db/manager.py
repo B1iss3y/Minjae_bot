@@ -3,6 +3,7 @@ DatabaseManager: aiosqlite 기반 비동기 DB 관리자
 모든 테이블 DDL 및 CRUD 메서드를 제공합니다.
 """
 
+import asyncio
 import aiosqlite
 import json
 from datetime import datetime
@@ -10,6 +11,10 @@ from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
 DB_PATH = "minjae_bot.db"
+
+
+class ActiveSessionError(RuntimeError):
+    """서버에 아직 끝나지 않은 모임 흐름이 있을 때 발생한다."""
 
 
 def _now_iso() -> str:
@@ -23,9 +28,12 @@ class DatabaseManager:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._db: aiosqlite.Connection | None = None
+        self._write_lock = asyncio.Lock()
 
     async def init(self):
         """DB 연결 및 테이블 초기화"""
+        if self._db is not None:
+            return
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
@@ -36,6 +44,7 @@ class DatabaseManager:
         """DB 연결 종료"""
         if self._db:
             await self._db.close()
+            self._db = None
 
     # ──────────────────────────── DDL ────────────────────────────
 
@@ -84,7 +93,11 @@ class DatabaseManager:
                 start_date      TEXT,
                 status          TEXT    NOT NULL DEFAULT '진행중',
                 deadline_at     TEXT,
-                created_at      TEXT
+                created_at      TEXT,
+                slots           TEXT,
+                winning_slot    TEXT,
+                confirmed_datetime TEXT,
+                attendance_message_id INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS vote_responses (
@@ -102,6 +115,16 @@ class DatabaseManager:
                 session_id      INTEGER NOT NULL,
                 user_id         INTEGER NOT NULL,
                 confirmed_slot  TEXT,
+                UNIQUE(session_id, user_id),
+                FOREIGN KEY (session_id) REFERENCES vote_sessions(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS attendance_responses (
+                session_id      INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                is_attending    INTEGER NOT NULL,
+                responded_at    TEXT NOT NULL,
+                PRIMARY KEY (session_id, user_id),
                 FOREIGN KEY (session_id) REFERENCES vote_sessions(id)
             );
 
@@ -116,7 +139,43 @@ class DatabaseManager:
                 completed_at        TEXT
             );
         """)
+        await self._migrate_schema()
         await self._db.commit()
+
+    async def _migrate_schema(self) -> None:
+        """기존 DB를 데이터 손실 없이 현재 스키마로 올린다."""
+
+        async with self._db.execute("PRAGMA table_info(vote_sessions)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        additions = {
+            "slots": "TEXT",
+            "winning_slot": "TEXT",
+            "confirmed_datetime": "TEXT",
+            "attendance_message_id": "INTEGER",
+        }
+        for name, data_type in additions.items():
+            if name not in columns:
+                await self._db.execute(
+                    f"ALTER TABLE vote_sessions ADD COLUMN {name} {data_type}"
+                )
+
+        # INSERT OR IGNORE가 실제로 중복을 막도록 레거시 중복을 먼저 정리한다.
+        await self._db.execute(
+            """
+            DELETE FROM session_attendees
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM session_attendees
+                GROUP BY session_id, user_id
+            )
+            """
+        )
+        await self._db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_session_attendees_session_user
+            ON session_attendees(session_id, user_id)
+            """
+        )
 
     # ──────────────────────── Server Config ────────────────────────
 
@@ -287,24 +346,72 @@ class DatabaseManager:
     async def create_vote_session(
         self,
         guild_id: int,
-        session_number: int,
         channel_id: int,
-        message_id: int,
         start_date: str,
         deadline_at: str,
-    ) -> int:
-        cur = await self._db.execute(
-            """
-            INSERT INTO vote_sessions
-                (guild_id, session_number, channel_id, message_id,
-                 start_date, status, deadline_at, created_at)
-            VALUES (?, ?, ?, ?, ?, '진행중', ?, ?)
-            """,
-            (guild_id, session_number, channel_id, message_id,
-             start_date, deadline_at, _now_iso()),
-        )
-        await self._db.commit()
-        return cur.lastrowid
+        slots: list[dict[str, str]],
+    ) -> dict:
+        """끝나지 않은 흐름이 없을 때 다음 실제 회차로 투표를 만든다.
+
+        회차는 카운터를 두 번 올리는 대신 완료된 기록의 다음 번호를 사용한다.
+        취소된 투표는 기록에 들어가지 않으므로 번호도 소비하지 않는다.
+        """
+
+        unresolved = ("진행중", "마감처리", "마감", "확정")
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                await self._db.execute(
+                    "INSERT OR IGNORE INTO server_config (guild_id) VALUES (?)",
+                    (guild_id,),
+                )
+                placeholders = ",".join("?" for _ in unresolved)
+                async with self._db.execute(
+                    f"""
+                    SELECT id FROM vote_sessions
+                    WHERE guild_id = ? AND status IN ({placeholders})
+                    LIMIT 1
+                    """,
+                    (guild_id, *unresolved),
+                ) as cur:
+                    if await cur.fetchone():
+                        raise ActiveSessionError(
+                            "아직 끝나지 않은 투표 또는 모임이 있습니다."
+                        )
+
+                async with self._db.execute(
+                    """
+                    SELECT COALESCE(MAX(session_number), 0) + 1
+                    FROM meeting_history
+                    WHERE guild_id = ?
+                    """,
+                    (guild_id,),
+                ) as cur:
+                    session_number = (await cur.fetchone())[0]
+
+                cur = await self._db.execute(
+                    """
+                    INSERT INTO vote_sessions
+                        (guild_id, session_number, channel_id, message_id,
+                         start_date, status, deadline_at, created_at, slots)
+                    VALUES (?, ?, ?, NULL, ?, '진행중', ?, ?, ?)
+                    """,
+                    (
+                        guild_id,
+                        session_number,
+                        channel_id,
+                        start_date,
+                        deadline_at,
+                        _now_iso(),
+                        json.dumps(slots, ensure_ascii=False),
+                    ),
+                )
+                session_id = cur.lastrowid
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+        return await self.get_vote_session(session_id)
 
     async def get_active_vote_session(self, guild_id: int) -> dict | None:
         async with self._db.execute(
@@ -313,6 +420,18 @@ class DatabaseManager:
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def get_recoverable_vote_sessions(self) -> list[dict]:
+        """재시작 후 View 또는 마감 작업을 되살려야 하는 세션 목록."""
+
+        async with self._db.execute(
+            """
+            SELECT * FROM vote_sessions
+            WHERE status IN ('진행중', '마감처리', '마감')
+            ORDER BY id
+            """
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
 
     async def get_vote_session(self, session_id: int) -> dict | None:
         async with self._db.execute(
@@ -345,6 +464,67 @@ class DatabaseManager:
         await self._db.execute(
             "UPDATE vote_sessions SET message_id = ? WHERE id = ?",
             (message_id, session_id),
+        )
+        await self._db.commit()
+
+    async def update_vote_session_slots(
+        self, session_id: int, slots: list[dict[str, str]]
+    ) -> None:
+        """복구 가능한 레거시 투표에 계산된 슬롯을 한 번 백필한다."""
+
+        await self._db.execute(
+            "UPDATE vote_sessions SET slots = ? WHERE id = ?",
+            (json.dumps(slots, ensure_ascii=False), session_id),
+        )
+        await self._db.commit()
+
+    async def claim_vote_close(self, session_id: int) -> bool:
+        """한 호출만 진행 중 투표의 마감을 소유하게 한다."""
+
+        async with self._write_lock:
+            cur = await self._db.execute(
+                """
+                UPDATE vote_sessions SET status = '마감처리'
+                WHERE id = ? AND status = '진행중'
+                """,
+                (session_id,),
+            )
+            await self._db.commit()
+            return cur.rowcount == 1
+
+    async def save_vote_winner(
+        self, session_id: int, winning_slot: str, confirmed_datetime: str
+    ) -> None:
+        await self._db.execute(
+            """
+            UPDATE vote_sessions
+            SET winning_slot = ?, confirmed_datetime = ?
+            WHERE id = ? AND status = '마감처리'
+            """,
+            (winning_slot, confirmed_datetime, session_id),
+        )
+        await self._db.commit()
+
+    async def finish_vote_close(
+        self, session_id: int, attendance_message_id: int
+    ) -> None:
+        await self._db.execute(
+            """
+            UPDATE vote_sessions
+            SET status = '마감', attendance_message_id = ?
+            WHERE id = ? AND status = '마감처리'
+            """,
+            (attendance_message_id, session_id),
+        )
+        await self._db.commit()
+
+    async def cancel_vote_session(self, session_id: int) -> None:
+        await self._db.execute(
+            """
+            UPDATE vote_sessions SET status = '취소'
+            WHERE id = ? AND status IN ('진행중', '마감처리')
+            """,
+            (session_id,),
         )
         await self._db.commit()
 
@@ -399,8 +579,10 @@ class DatabaseManager:
     ) -> None:
         await self._db.execute(
             """
-            INSERT OR IGNORE INTO session_attendees (session_id, user_id, confirmed_slot)
+            INSERT INTO session_attendees (session_id, user_id, confirmed_slot)
             VALUES (?, ?, ?)
+            ON CONFLICT(session_id, user_id)
+            DO UPDATE SET confirmed_slot=excluded.confirmed_slot
             """,
             (session_id, user_id, confirmed_slot),
         )
@@ -419,6 +601,84 @@ class DatabaseManager:
         ) as cur:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+    async def set_attendance_response(
+        self,
+        session_id: int,
+        user_id: int,
+        is_attending: bool,
+        confirmed_slot: str,
+    ) -> int:
+        """참석/불참 응답과 실제 참석자 목록을 한 트랜잭션으로 맞춘다."""
+
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                await self._db.execute(
+                    """
+                    INSERT INTO attendance_responses
+                        (session_id, user_id, is_attending, responded_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(session_id, user_id)
+                    DO UPDATE SET is_attending=excluded.is_attending,
+                                  responded_at=excluded.responded_at
+                    """,
+                    (session_id, user_id, int(is_attending), _now_iso()),
+                )
+                if is_attending:
+                    await self._db.execute(
+                        """
+                        INSERT INTO session_attendees
+                            (session_id, user_id, confirmed_slot)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(session_id, user_id)
+                        DO UPDATE SET confirmed_slot=excluded.confirmed_slot
+                        """,
+                        (session_id, user_id, confirmed_slot),
+                    )
+                else:
+                    await self._db.execute(
+                        """
+                        DELETE FROM session_attendees
+                        WHERE session_id = ? AND user_id = ?
+                        """,
+                        (session_id, user_id),
+                    )
+                async with self._db.execute(
+                    "SELECT COUNT(*) FROM session_attendees WHERE session_id = ?",
+                    (session_id,),
+                ) as cur:
+                    attendee_count = (await cur.fetchone())[0]
+                await self._db.commit()
+                return attendee_count
+            except Exception:
+                await self._db.rollback()
+                raise
+
+    async def get_attendance_response_count(self, session_id: int) -> int:
+        async with self._db.execute(
+            "SELECT COUNT(*) FROM attendance_responses WHERE session_id = ?",
+            (session_id,),
+        ) as cur:
+            return (await cur.fetchone())[0]
+
+    async def confirm_vote_session(self, session_id: int) -> bool:
+        """참석자가 있을 때 한 호출만 세션을 확정하게 한다."""
+
+        async with self._write_lock:
+            cur = await self._db.execute(
+                """
+                UPDATE vote_sessions SET status = '확정'
+                WHERE id = ? AND status = '마감'
+                  AND EXISTS (
+                      SELECT 1 FROM session_attendees
+                      WHERE session_attendees.session_id = vote_sessions.id
+                  )
+                """,
+                (session_id,),
+            )
+            await self._db.commit()
+            return cur.rowcount == 1
 
     # ──────────────────────── Meeting History ────────────────────────
 
@@ -456,6 +716,87 @@ class DatabaseManager:
             (_now_iso(), history_id),
         )
         await self._db.commit()
+
+    async def complete_session(
+        self,
+        session_id: int,
+        game_app_id: int,
+        game_title: str,
+    ) -> dict | None:
+        """확정 세션을 정확히 한 번 완료 기록으로 전환한다."""
+
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                async with self._db.execute(
+                    "SELECT * FROM vote_sessions WHERE id = ?", (session_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None or row["status"] != "확정":
+                    await self._db.rollback()
+                    return None
+
+                session = dict(row)
+                async with self._db.execute(
+                    """
+                    SELECT user_id FROM session_attendees
+                    WHERE session_id = ? ORDER BY id
+                    """,
+                    (session_id,),
+                ) as cur:
+                    attendee_ids = [item[0] for item in await cur.fetchall()]
+
+                async with self._db.execute(
+                    """
+                    SELECT id FROM meeting_history
+                    WHERE guild_id = ? AND session_number = ?
+                    ORDER BY id LIMIT 1
+                    """,
+                    (session["guild_id"], session["session_number"]),
+                ) as cur:
+                    existing = await cur.fetchone()
+                if existing:
+                    history_id = existing[0]
+                else:
+                    cur = await self._db.execute(
+                        """
+                        INSERT INTO meeting_history
+                            (guild_id, session_number, confirmed_datetime,
+                             attendees, game_app_id, game_title, completed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session["guild_id"],
+                            session["session_number"],
+                            session["confirmed_datetime"],
+                            json.dumps(attendee_ids),
+                            game_app_id,
+                            game_title,
+                            _now_iso(),
+                        ),
+                    )
+                    history_id = cur.lastrowid
+
+                await self._db.execute(
+                    """
+                    UPDATE wishlist SET status = '완료'
+                    WHERE guild_id = ? AND app_id = ?
+                    """,
+                    (session["guild_id"], game_app_id),
+                )
+                await self._db.execute(
+                    "UPDATE vote_sessions SET status = '완료' WHERE id = ?",
+                    (session_id,),
+                )
+                await self._db.commit()
+                return {
+                    "history_id": history_id,
+                    "session": session,
+                    "attendee_ids": attendee_ids,
+                }
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def get_meeting_history(
         self, guild_id: int, session_number: int | None = None

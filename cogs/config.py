@@ -1,7 +1,8 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import re
+
+from utils.schedule import parse_config_time
 
 class ConfigCog(commands.Cog):
     def __init__(self, bot):
@@ -10,14 +11,20 @@ class ConfigCog(commands.Cog):
     @app_commands.command(name="서버설정", description="서버의 기본 시간을 설정합니다.")
     @app_commands.checks.has_permissions(administrator=True)
     async def config_server(self, interaction: discord.Interaction, 기본_낮시간: str = '14:00', 기본_밤시간: str = '24:00', 기본_마감기한: int = 24):
-        time_pattern = re.compile(r"^([01]?\d|2[0-4]):([0-5]\d)$")
-        
-        if not time_pattern.match(기본_낮시간):
-            await interaction.response.send_message("기본_낮시간 형식이 올바르지 않습니다. HH:MM 형식으로 입력해주세요.", ephemeral=True)
+        try:
+            parse_config_time(기본_낮시간)
+            parse_config_time(기본_밤시간)
+        except ValueError as exc:
+            await interaction.response.send_message(
+                f"시간 설정이 올바르지 않습니다: {exc}", ephemeral=True
+            )
             return
-            
-        if not time_pattern.match(기본_밤시간):
-            await interaction.response.send_message("기본_밤시간 형식이 올바르지 않습니다. HH:MM 형식으로 입력해주세요.", ephemeral=True)
+
+        if not 1 <= 기본_마감기한 <= 168:
+            await interaction.response.send_message(
+                "기본_마감기한은 1시간 이상 168시간 이하로 입력해주세요.",
+                ephemeral=True,
+            )
             return
 
         try:

@@ -21,9 +21,6 @@ intents.guilds = True
 intents.members = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-bot.db = DatabaseManager()
-
 # 로드할 Cog 목록
 COG_EXTENSIONS = [
     "cogs.config",
@@ -35,27 +32,48 @@ COG_EXTENSIONS = [
 ]
 
 
+class MinjaeBot(commands.Bot):
+    """연결 재개와 무관하게 초기화가 한 번만 수행되는 Bot."""
+
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        self.db = DatabaseManager()
+
+    async def setup_hook(self):
+        """Discord 연결 전에 DB, Cog, persistent View를 준비한다."""
+
+        await self.db.init()
+        print("✅ DB 초기화 완료")
+
+        for ext in COG_EXTENSIONS:
+            try:
+                await self.load_extension(ext)
+                print(f"  ✅ {ext} 로드 완료")
+            except Exception as exc:
+                print(f"  ❌ {ext} 로드 실패: {exc}")
+
+        try:
+            synced = await self.tree.sync()
+            print(f"✅ {len(synced)}개 슬래시 커맨드 동기화 완료")
+        except Exception as exc:
+            print(f"❌ 커맨드 동기화 실패: {exc}")
+
+    async def close(self):
+        """백그라운드 마감 작업과 DB 연결을 정리한다."""
+
+        vote_cog = self.get_cog("VoteCog")
+        if vote_cog:
+            await vote_cog.shutdown()
+        await self.db.close()
+        await super().close()
+
+
+bot = MinjaeBot()
+
+
 @bot.event
 async def on_ready():
-    """봇 준비 완료 시 DB 초기화 및 슬래시 커맨드 동기화"""
-    await bot.db.init()
-    print(f"✅ DB 초기화 완료")
-
-    # Cog 로드
-    for ext in COG_EXTENSIONS:
-        try:
-            await bot.load_extension(ext)
-            print(f"  ✅ {ext} 로드 완료")
-        except Exception as e:
-            print(f"  ❌ {ext} 로드 실패: {e}")
-
-    # 슬래시 커맨드 동기화
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ {len(synced)}개 슬래시 커맨드 동기화 완료")
-    except Exception as e:
-        print(f"❌ 커맨드 동기화 실패: {e}")
-
+    """재연결 때는 상태를 다시 초기화하지 않고 접속 정보만 알린다."""
     print(f"🤖 {bot.user.name} 온라인! (서버 {len(bot.guilds)}개)")
 
 

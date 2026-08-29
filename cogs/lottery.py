@@ -16,23 +16,36 @@ class PlayCompleteView(discord.ui.View):
         self.session = session
         self.game = game
 
-    @discord.ui.button(label="플레이 완료", style=discord.ButtonStyle.success)
+    @discord.ui.button(
+        label="플레이 완료",
+        style=discord.ButtonStyle.success,
+        custom_id="game:complete",
+    )
     async def complete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Admin check
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("관리자만 사용할 수 있는 버튼입니다.", ephemeral=True)
             return
 
-        # Change status to '완료'
-        await self.bot.db.update_game_status(interaction.guild_id, self.game['app_id'], '완료')
-        
-        # Trigger archive
+        # 게임·세션·기록을 하나의 멱등 트랜잭션으로 완료한다.
         archive_cog = self.bot.get_cog('ArchiveCog')
         if archive_cog:
-            await archive_cog.archive_session(interaction.guild_id, self.session, self.game)
-            await interaction.response.send_message("플레이가 완료되어 기록이 저장되었습니다.", ephemeral=True)
+            completed = await archive_cog.archive_session(
+                interaction.guild_id, self.session, self.game
+            )
+            if completed:
+                await interaction.response.send_message(
+                    "플레이가 완료되어 기록이 저장되었습니다.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "이미 완료되었거나 현재 완료할 수 없는 모임입니다.",
+                    ephemeral=True,
+                )
+                return
         else:
             await interaction.response.send_message("ArchiveCog를 찾을 수 없습니다.", ephemeral=True)
+            return
             
         # Disable button
         button.disabled = True
