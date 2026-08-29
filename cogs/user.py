@@ -67,5 +67,30 @@ class UserCog(commands.Cog):
         view = UserRegisterView(self.bot)
         await interaction.response.send_message("아래 메뉴에서 사용 중인 운영체제를 선택해주세요.", view=view, ephemeral=True)
 
+    @app_commands.command(name="친구코드", description="서버에 등록된 유저들의 스팀 친구 코드를 확인합니다.")
+    async def friend_codes(self, interaction: discord.Interaction):
+        users = await self.bot.db.get_all_users(interaction.guild_id)
+        if not users:
+            await interaction.response.send_message(
+                "📭 등록된 유저가 없습니다. `/내정보등록`으로 먼저 등록해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="🎮 스팀 친구 코드 목록",
+            color=discord.Color.blue(),
+        )
+        for user in users:
+            os_emoji = "🍎" if user.get("os_type") == "macOS" else "🪟"
+            code = user.get("steam_friend_code") or "미등록"
+            embed.add_field(
+                name=f"{os_emoji} {user.get('nickname', '알 수 없음')}",
+                value=f"`{code}`",
+                inline=True,
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 async def setup(bot):
     await bot.add_cog(UserCog(bot))

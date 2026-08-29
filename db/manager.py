@@ -341,6 +341,33 @@ class DatabaseManager:
         )
         await self._db.commit()
 
+    async def delete_wishlist_game(
+        self, guild_id: int, app_id: int, user_id: int
+    ) -> str | None:
+        """본인이 신청한 미플레이 게임만 삭제한다.
+
+        Returns:
+            삭제된 게임 타이틀 (성공 시) / None (실패 시)
+        """
+        async with self._db.execute(
+            "SELECT title, added_by, status FROM wishlist WHERE guild_id = ? AND app_id = ?",
+            (guild_id, app_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        if row["added_by"] != user_id:
+            raise PermissionError("본인이 신청한 게임만 삭제할 수 있습니다.")
+        if row["status"] != "미플레이":
+            raise ValueError(f"'{row['status']}' 상태의 게임은 삭제할 수 없습니다. 미플레이 상태만 삭제 가능합니다.")
+        title = row["title"]
+        await self._db.execute(
+            "DELETE FROM wishlist WHERE guild_id = ? AND app_id = ?",
+            (guild_id, app_id),
+        )
+        await self._db.commit()
+        return title
+
     # ──────────────────────── Vote Sessions ────────────────────────
 
     async def create_vote_session(

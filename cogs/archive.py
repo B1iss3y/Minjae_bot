@@ -73,7 +73,7 @@ class ArchiveCog(commands.Cog):
             if len(history) > 10:
                 embed.set_footer(text="최근 10개의 기록만 표시됩니다. 특정 회차를 보려면 회차를 입력하세요.")
                 
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
         else:
             # Show specific meeting
             history = await self.bot.db.get_meeting_history(guild_id, session_number=session_number)
@@ -97,7 +97,7 @@ class ArchiveCog(commands.Cog):
             dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "알 수 없음"
             embed.add_field(name="확정 일시", value=dt_str, inline=False)
             
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(ArchiveCog(bot))

@@ -225,7 +225,7 @@ class Wishlist(commands.Cog):
         app_commands.Choice(name="보관", value="보관"),
     ])
     async def wishlist_list(self, interaction: discord.Interaction, status_filter: Optional[app_commands.Choice[str]] = None):
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         status_val = status_filter.value if status_filter else None
         items = await self.bot.db.get_wishlist(interaction.guild_id, status_val)
         
@@ -273,6 +273,57 @@ class Wishlist(commands.Cog):
             color=discord.Color.green()
         )
         await interaction.followup.send(embed=embed, ephemeral=False)
+
+    @app_commands.command(name="게임삭제", description="본인이 신청한 위시리스트 게임을 삭제합니다.")
+    @app_commands.describe(game_title="삭제할 게임 이름 (일부 입력 가능)")
+    async def delete_game(self, interaction: discord.Interaction, game_title: str):
+        await interaction.response.defer(ephemeral=True)
+        guild_id = interaction.guild_id
+        user_id = interaction.user.id
+
+        # 본인이 신청한 게임만 검색
+        all_games = await self.bot.db.get_wishlist(guild_id)
+        my_matches = [
+            g for g in all_games
+            if game_title.lower() in g.get("title", "").lower()
+            and g.get("added_by") == user_id
+        ]
+
+        if not my_matches:
+            await interaction.followup.send(
+                f"❌ '{game_title}'과(와) 일치하는 본인이 신청한 게임을 찾을 수 없습니다.",
+                ephemeral=True,
+            )
+            return
+
+        if len(my_matches) > 1:
+            titles = "\n".join(f"- {g['title']}" for g in my_matches[:5])
+            await interaction.followup.send(
+                f"⚠️ 여러 게임이 검색되었습니다. 좀 더 정확한 이름을 입력해주세요:\n{titles}",
+                ephemeral=True,
+            )
+            return
+
+        game = my_matches[0]
+        try:
+            deleted_title = await self.bot.db.delete_wishlist_game(
+                guild_id, game["app_id"], user_id
+            )
+            if deleted_title:
+                embed = discord.Embed(
+                    title="🗑️ 게임 삭제 완료",
+                    description=f"**{deleted_title}**이(가) 위시리스트에서 삭제되었습니다.",
+                    color=discord.Color.orange(),
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    "❌ 게임을 찾을 수 없습니다.", ephemeral=True
+                )
+        except PermissionError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
 
 
 async def setup(bot):
