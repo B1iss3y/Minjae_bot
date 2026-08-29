@@ -1,0 +1,105 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+KST = ZoneInfo('Asia/Seoul')
+
+class ArchiveCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def archive_session(self, guild_id: int, session: dict, game: dict):
+        attendees = await self.bot.db.get_attendees(session['id'])
+        attendee_ids = [att['user_id'] for att in attendees]
+        
+        # Create meeting history record
+        await self.bot.db.add_meeting_history(
+            guild_id=guild_id,
+            session_number=session['session_number'],
+            confirmed_datetime=session.get('deadline_at', datetime.now(KST).isoformat()),
+            attendees=attendee_ids,
+            game_app_id=game['app_id'],
+            game_title=game['title']
+        )
+        
+        # Increment session number
+        new_session_number = await self.bot.db.increment_session_number(guild_id)
+        
+        # Send celebration embed
+        channel = self.bot.get_channel(session['channel_id'])
+        if channel:
+            mentions = " ".join([f"<@{att['user_id']}>" for att in attendees])
+            
+            embed = discord.Embed(
+                title=f"🎉 제{session['session_number']}회 모임 플레이 완료!",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="플레이 게임", value=game['title'], inline=False)
+            embed.add_field(name="참여자", value=mentions if mentions else "없음", inline=False)
+            
+            # Formatting confirmed datetime
+            dt = datetime.fromisoformat(session['deadline_at']) if session.get('deadline_at') else datetime.now(KST)
+            embed.add_field(name="확정 일시", value=dt.strftime("%Y-%m-%d %H:%M"), inline=False)
+            
+            if game.get('header_image'):
+                embed.set_image(url=game['header_image'])
+                
+            await channel.send(embed=embed)
+
+    @app_commands.command(name="모임기록", description="이전 모임 기록을 확인합니다.")
+    @app_commands.describe(session_number="확인할 모임의 회차 (선택사항)")
+    async def meeting_history(self, interaction: discord.Interaction, session_number: int = None):
+        guild_id = interaction.guild_id
+        
+        if session_number is None:
+            # Show list of past meetings
+            history = await self.bot.db.get_meeting_history(guild_id)
+            if not history:
+                await interaction.response.send_message("기록된 모임이 없습니다.", ephemeral=True)
+                return
+                
+            embed = discord.Embed(title="📚 지난 모임 기록", color=discord.Color.blue())
+            
+            # Showing top 10 recent meetings or all
+            for record in history[:10]:
+                title = record.get('game_title', '알 수 없는 게임')
+                embed.add_field(
+                    name=f"제{record['session_number']}회 모임",
+                    value=f"게임: {title}\n일시: {record['confirmed_datetime'][:10]}",
+                    inline=False
+                )
+            
+            if len(history) > 10:
+                embed.set_footer(text="최근 10개의 기록만 표시됩니다. 특정 회차를 보려면 회차를 입력하세요.")
+                
+            await interaction.response.send_message(embed=embed)
+        else:
+            # Show specific meeting
+            history = await self.bot.db.get_meeting_history(guild_id, session_number=session_number)
+            if not history:
+                await interaction.response.send_message(f"제{session_number}회 모임 기록을 찾을 수 없습니다.", ephemeral=True)
+                return
+                
+            record = history[0] if isinstance(history, list) else history
+            
+            embed = discord.Embed(
+                title=f"제{record['session_number']}회 모임 기록",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="플레이 게임", value=record.get('game_title', '알 수 없음'), inline=False)
+            
+            attendees_list = json.loads(record['attendees']) if record.get('attendees') else []
+            mentions = " ".join([f"<@{uid}>" for uid in attendees_list])
+            embed.add_field(name="참여자", value=mentions if mentions else "없음", inline=False)
+            
+            dt = datetime.fromisoformat(record['confirmed_datetime']) if record.get('confirmed_datetime') else None
+            dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "알 수 없음"
+            embed.add_field(name="확정 일시", value=dt_str, inline=False)
+            
+            await interaction.response.send_message(embed=embed)
+
+async def setup(bot):
+    await bot.add_cog(ArchiveCog(bot))
