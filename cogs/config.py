@@ -8,7 +8,7 @@ class ConfigCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="서버설정", description="서버의 기본 시간을 설정합니다.")
+    @app_commands.command(name="서버설정", description="[관리자] 서버의 기본 시간을 설정합니다.")
     @app_commands.checks.has_permissions(administrator=True)
     async def config_server(self, interaction: discord.Interaction, 기본_낮시간: str = '14:00', 기본_밤시간: str = '24:00', 기본_마감기한: int = 24):
         try:

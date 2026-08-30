@@ -238,7 +238,7 @@ class Wishlist(commands.Cog):
         await interaction.followup.send(embed=view.generate_embed(), view=view)
 
 
-    @app_commands.command(name="게임상태변경", description="위시리스트의 게임 상태를 변경합니다. (관리자 전용)")
+    @app_commands.command(name="게임상태변경", description="[관리자] 위시리스트의 게임 상태를 변경합니다.")
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(game_title="상태를 변경할 게임 이름 (일부 입력 가능)", status="변경할 상태")
     @app_commands.choices(status=[

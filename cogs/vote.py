@@ -591,6 +591,180 @@ class VoteCog(commands.Cog):
         self.vote_views[session["id"]] = view
         self.schedule_deadline(view, session)
 
+    # ────────────────── 수동 일정 확정 ──────────────────
+
+    @staticmethod
+    def _parse_user_datetime(text: str) -> datetime:
+        """유저 입력 일시를 KST datetime으로 파싱한다.
+
+        지원 형식:
+          - YYYY-MM-DD HH:MM
+          - MM/DD HH:MM  (올해 자동 적용)
+          - M/D HH:MM
+        """
+        text = text.strip()
+        for fmt in ("%Y-%m-%d %H:%M", "%m/%d %H:%M"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                if parsed.year == 1900:  # strptime default year
+                    parsed = parsed.replace(year=datetime.now(KST).year)
+                return parsed.replace(tzinfo=KST)
+            except ValueError:
+                continue
+        raise ValueError(
+            "일시 형식이 올바르지 않습니다.\n"
+            "예시: `2026-08-31 14:00` 또는 `8/31 14:00`"
+        )
+
+    async def _disable_vote_view(self, session_id: int) -> None:
+        """진행 중인 투표 View의 버튼을 비활성화하고 타이머를 취소한다."""
+        self.cancel_deadline(session_id)
+        view = self.vote_views.pop(session_id, None)
+        if view and view.message:
+            view.closed = True
+            for item in view.children:
+                item.disabled = True
+            try:
+                embed = discord.Embed(
+                    title="일정 투표 종료",
+                    description="관리자에 의해 수동으로 일정이 확정되었습니다.",
+                    color=discord.Color.greyple(),
+                )
+                await view.message.edit(embed=embed, view=view)
+            except discord.HTTPException:
+                pass
+
+    async def _disable_attendance_view(self, session_id: int) -> None:
+        """참석 확인 View의 버튼을 비활성화한다."""
+        view = self.attendance_views.pop(session_id, None)
+        if view and view.message:
+            for item in view.children:
+                item.disabled = True
+            try:
+                await view.message.edit(view=view)
+            except discord.HTTPException:
+                pass
+
+    @app_commands.command(
+        name="일정수동확정",
+        description="[관리자] 투표 없이 모임 일정을 직접 확정합니다.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(일시="확정할 일시 (예: 2026-08-31 14:00 또는 8/31 14:00)")
+    async def manual_confirm(self, interaction: discord.Interaction, 일시: str):
+        try:
+            confirmed_dt = self._parse_user_datetime(일시)
+        except ValueError as exc:
+            await interaction.response.send_message(
+                f"❌ {exc}", ephemeral=True
+            )
+            return
+
+        guild_id = interaction.guild_id
+        await interaction.response.defer()
+
+        winning_slot = f"{confirmed_dt:%m/%d} {confirmed_dt:%H:%M} (수동 확정)"
+
+        # 진행 중인 투표가 있으면 인수
+        active = await self.bot.db.get_active_vote_session(guild_id)
+        if active:
+            session_id = active["id"]
+            await self._disable_vote_view(session_id)
+
+            # 상태 전환: 진행중 → 마감처리 → 마감
+            await self.bot.db.claim_vote_close(session_id)
+            await self.bot.db.save_vote_winner(
+                session_id, winning_slot, confirmed_dt.isoformat()
+            )
+            # 참석 확인 View 전송
+            session = await self.bot.db.get_vote_session(session_id)
+        else:
+            # 신규 세션 생성
+            try:
+                session = await self.bot.db.create_manual_confirmed_session(
+                    guild_id=guild_id,
+                    channel_id=interaction.channel_id,
+                    confirmed_datetime=confirmed_dt.isoformat(),
+                    winning_slot=winning_slot,
+                )
+            except ActiveSessionError as exc:
+                await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+                return
+            session_id = session["id"]
+
+        # 참석 확인 임베드 + View
+        confirm_embed = discord.Embed(
+            title=f"📋 제{session['session_number']}회 수동 일정 확정",
+            description=(
+                f"**{winning_slot}**\n"
+                f"실제 일시: <t:{int(confirmed_dt.timestamp())}:F>\n\n"
+                "참석 여부를 선택해주세요."
+            ),
+            color=discord.Color.blue(),
+        )
+        confirm_view = AttendanceView(
+            self.bot, session_id, winning_slot, guild_id
+        )
+        attendance_msg = await interaction.followup.send(
+            embed=confirm_embed, view=confirm_view, wait=True
+        )
+        confirm_view.message = attendance_msg
+        await self.bot.db.finish_vote_close(session_id, attendance_msg.id)
+        self.bot.add_view(confirm_view, message_id=attendance_msg.id)
+        self.attendance_views[session_id] = confirm_view
+
+    # ────────────────── 모임 강제 취소 ──────────────────
+
+    @app_commands.command(
+        name="모임강제취소",
+        description="[관리자] 진행 중이거나 확정된 모임을 취소하고 데이터를 롤백합니다.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(사유="취소 사유 (선택)")
+    async def force_cancel(
+        self, interaction: discord.Interaction, 사유: str = None
+    ):
+        guild_id = interaction.guild_id
+        await interaction.response.defer()
+
+        # View 정리
+        unresolved = await self.bot.db.get_unresolved_session(guild_id)
+        if unresolved:
+            session_id = unresolved["id"]
+            await self._disable_vote_view(session_id)
+            await self._disable_attendance_view(session_id)
+        else:
+            await interaction.followup.send(
+                "⚠️ 취소할 수 있는 활성 세션이 없습니다.", ephemeral=True
+            )
+            return
+
+        # DB 취소 + 게임 롤백
+        cancelled = await self.bot.db.force_cancel_session(guild_id)
+        if cancelled is None:
+            await interaction.followup.send(
+                "⚠️ 취소할 수 있는 활성 세션이 없습니다.", ephemeral=True
+            )
+            return
+
+        # 안내 임베드
+        desc = f"제{cancelled['session_number']}회 모임이 취소되었습니다."
+        if 사유:
+            desc += f"\n📝 사유: {사유}"
+
+        game_app_id = cancelled.get("selected_game_app_id")
+        if game_app_id:
+            desc += "\n🔄 연결된 게임 상태가 '미플레이'로 복원되었습니다."
+
+        embed = discord.Embed(
+            title="🚫 모임 강제 취소",
+            description=desc,
+            color=discord.Color.red(),
+        )
+        await interaction.followup.send(embed=embed)
+
 
 async def setup(bot):
     await bot.add_cog(VoteCog(bot))

@@ -152,6 +152,7 @@ class DatabaseManager:
             "winning_slot": "TEXT",
             "confirmed_datetime": "TEXT",
             "attendance_message_id": "INTEGER",
+            "selected_game_app_id": "INTEGER",
         }
         for name, data_type in additions.items():
             if name not in columns:
@@ -554,6 +555,145 @@ class DatabaseManager:
             (session_id,),
         )
         await self._db.commit()
+
+    async def get_unresolved_session(self, guild_id: int) -> dict | None:
+        """진행중/마감처리/마감/확정 중 가장 최근 세션을 반환한다."""
+        unresolved = ("진행중", "마감처리", "마감", "확정")
+        placeholders = ",".join("?" for _ in unresolved)
+        async with self._db.execute(
+            f"""
+            SELECT * FROM vote_sessions
+            WHERE guild_id = ? AND status IN ({placeholders})
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id, *unresolved),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def create_manual_confirmed_session(
+        self,
+        guild_id: int,
+        channel_id: int,
+        confirmed_datetime: str,
+        winning_slot: str,
+    ) -> dict:
+        """투표 없이 관리자가 직접 확정 세션을 생성한다."""
+        unresolved = ("진행중", "마감처리", "마감", "확정")
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                await self._db.execute(
+                    "INSERT OR IGNORE INTO server_config (guild_id) VALUES (?)",
+                    (guild_id,),
+                )
+                placeholders = ",".join("?" for _ in unresolved)
+                async with self._db.execute(
+                    f"""
+                    SELECT id FROM vote_sessions
+                    WHERE guild_id = ? AND status IN ({placeholders})
+                    LIMIT 1
+                    """,
+                    (guild_id, *unresolved),
+                ) as cur:
+                    if await cur.fetchone():
+                        raise ActiveSessionError(
+                            "아직 끝나지 않은 투표 또는 모임이 있습니다."
+                        )
+
+                async with self._db.execute(
+                    """
+                    SELECT COALESCE(MAX(session_number), 0) + 1
+                    FROM meeting_history
+                    WHERE guild_id = ?
+                    """,
+                    (guild_id,),
+                ) as cur:
+                    session_number = (await cur.fetchone())[0]
+
+                cur = await self._db.execute(
+                    """
+                    INSERT INTO vote_sessions
+                        (guild_id, session_number, channel_id, message_id,
+                         start_date, status, deadline_at, created_at,
+                         winning_slot, confirmed_datetime)
+                    VALUES (?, ?, ?, NULL, ?, '마감', ?, ?, ?, ?)
+                    """,
+                    (
+                        guild_id,
+                        session_number,
+                        channel_id,
+                        _now_iso(),
+                        _now_iso(),
+                        _now_iso(),
+                        winning_slot,
+                        confirmed_datetime,
+                    ),
+                )
+                session_id = cur.lastrowid
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+        return await self.get_vote_session(session_id)
+
+    async def set_session_game(self, session_id: int, app_id: int) -> None:
+        """세션에 선정된 게임 AppID를 기록한다."""
+        await self._db.execute(
+            "UPDATE vote_sessions SET selected_game_app_id = ? WHERE id = ?",
+            (app_id, session_id),
+        )
+        await self._db.commit()
+
+    async def force_cancel_session(self, guild_id: int) -> dict | None:
+        """활성 세션을 취소하고 연결된 게임 상태를 롤백한다.
+
+        Returns:
+            취소된 세션 dict, 없으면 None
+        """
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                unresolved = ("진행중", "마감처리", "마감", "확정")
+                placeholders = ",".join("?" for _ in unresolved)
+                async with self._db.execute(
+                    f"""
+                    SELECT * FROM vote_sessions
+                    WHERE guild_id = ? AND status IN ({placeholders})
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (guild_id, *unresolved),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is None:
+                    await self._db.rollback()
+                    return None
+
+                session = dict(row)
+                session_id = session["id"]
+
+                # 세션 상태 → 취소
+                await self._db.execute(
+                    "UPDATE vote_sessions SET status = '취소' WHERE id = ?",
+                    (session_id,),
+                )
+
+                # 연결된 게임 롤백
+                game_app_id = session.get("selected_game_app_id")
+                if game_app_id:
+                    await self._db.execute(
+                        """
+                        UPDATE wishlist SET status = '미플레이'
+                        WHERE guild_id = ? AND app_id = ? AND status = '진행 중'
+                        """,
+                        (guild_id, game_app_id),
+                    )
+
+                await self._db.commit()
+                return session
+            except Exception:
+                await self._db.rollback()
+                raise
 
     # ──────────────────────── Vote Responses ────────────────────────
 

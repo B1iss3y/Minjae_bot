@@ -130,8 +130,9 @@ class LotteryCog(commands.Cog):
         # 5. Weighted random selection
         selected_game = random.choices(games, weights=weights, k=1)[0]
         
-        # 6. Update game status
+        # 6. Update game status + 세션에 게임 연결
         await self.bot.db.update_game_status(guild_id, selected_game['app_id'], '진행 중')
+        await self.bot.db.set_session_game(session['id'], selected_game['app_id'])
         
         # Find breakdown for selected game
         selected_breakdown = next(b for b in weight_breakdowns if b[0] == selected_game['app_id'])
@@ -151,5 +152,86 @@ class LotteryCog(commands.Cog):
         view = PlayCompleteView(self.bot, session, selected_game)
         await interaction.response.send_message(embed=embed, view=view)
 
+    # ────────────────── 게임 수동 지정 ──────────────────
+
+    @app_commands.command(
+        name="게임선정수동",
+        description="[관리자] 위시리스트에서 게임을 직접 지정합니다.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(게임명="지정할 게임 이름 (일부 입력 가능)")
+    async def manual_draw(self, interaction: discord.Interaction, 게임명: str):
+        guild_id = interaction.guild_id
+
+        # 확정 세션 확인
+        session = await self.bot.db.get_latest_confirmed_session(guild_id)
+        if not session:
+            await interaction.response.send_message(
+                "⚠️ 확정된 모임 세션이 없습니다. 먼저 일정을 확정해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        # 미플레이 게임 검색
+        games = await self.bot.db.get_eligible_games(guild_id)
+        matches = [
+            g for g in games
+            if 게임명.lower() in g.get("title", "").lower()
+        ]
+
+        if not matches:
+            await interaction.response.send_message(
+                f"❌ '{게임명}'과(와) 일치하는 미플레이 게임을 찾을 수 없습니다.",
+                ephemeral=True,
+            )
+            return
+
+        if len(matches) > 1:
+            titles = "\n".join(f"- {g['title']}" for g in matches[:10])
+            await interaction.response.send_message(
+                f"⚠️ 여러 게임이 검색되었습니다. 좀 더 정확한 이름을 입력해주세요:\n{titles}",
+                ephemeral=True,
+            )
+            return
+
+        selected_game = matches[0]
+
+        # 상태 변경 + 세션 연결
+        await self.bot.db.update_game_status(
+            guild_id, selected_game["app_id"], "진행 중"
+        )
+        await self.bot.db.set_session_game(
+            session["id"], selected_game["app_id"]
+        )
+
+        # 임베드 카드
+        embed = discord.Embed(
+            title="🎯 게임 수동 선정!",
+            description=(
+                f"**[{selected_game['title']}]"
+                f"(https://store.steampowered.com/app/{selected_game['app_id']})**"
+            ),
+            color=discord.Color.gold(),
+        )
+        if selected_game.get("header_image"):
+            embed.set_image(url=selected_game["header_image"])
+
+        price_overview = selected_game.get("price_overview")
+        if isinstance(price_overview, str) and price_overview:
+            try:
+                price_overview = json.loads(price_overview)
+            except json.JSONDecodeError:
+                price_overview = None
+        price_text = format_price(
+            price_overview, selected_game.get("is_free", False)
+        )
+        embed.add_field(name="가격", value=price_text, inline=True)
+        embed.set_footer(text="관리자에 의해 직접 선정되었습니다.")
+
+        view = PlayCompleteView(self.bot, session, selected_game)
+        await interaction.response.send_message(embed=embed, view=view)
+
 async def setup(bot):
     await bot.add_cog(LotteryCog(bot))
+
