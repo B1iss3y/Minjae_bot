@@ -99,5 +99,35 @@ class ArchiveCog(commands.Cog):
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    @app_commands.command(name="모임기록삭제", description="[관리자] 지정한 회차의 모임 기록을 삭제합니다.")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(회차번호="삭제할 모임의 회차 번호")
+    async def delete_meeting_history(self, interaction: discord.Interaction, 회차번호: int):
+        guild_id = interaction.guild_id
+        await interaction.response.defer()
+
+        deleted_record = await self.bot.db.delete_meeting_history(guild_id, 회차번호)
+        
+        if not deleted_record:
+            await interaction.followup.send(
+                f"⚠️ 제{회차번호}회 모임 기록을 찾을 수 없습니다.", 
+                ephemeral=True
+            )
+            return
+            
+        game_title = deleted_record.get('game_title', '알 수 없는 게임')
+        desc = f"제{회차번호}회 모임 기록이 성공적으로 삭제되었습니다."
+        
+        if deleted_record.get('game_app_id'):
+            desc += f"\n🔄 연결된 게임(**{game_title}**) 상태가 '미플레이'로 복원되었습니다."
+            
+        embed = discord.Embed(
+            title="🗑️ 모임 기록 삭제",
+            description=desc,
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+
+
 async def setup(bot):
     await bot.add_cog(ArchiveCog(bot))

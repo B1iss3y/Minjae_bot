@@ -985,3 +985,47 @@ class DatabaseManager:
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def delete_meeting_history(self, guild_id: int, session_number: int) -> dict | None:
+        """모임 기록을 삭제하고 연결된 게임 상태를 미플레이로 롤백한다.
+
+        Returns:
+            삭제된 모임 기록 dict, 없으면 None
+        """
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                async with self._db.execute(
+                    "SELECT * FROM meeting_history WHERE guild_id = ? AND session_number = ?",
+                    (guild_id, session_number),
+                ) as cur:
+                    row = await cur.fetchone()
+                
+                if not row:
+                    await self._db.rollback()
+                    return None
+                
+                record = dict(row)
+                game_app_id = record.get("game_app_id")
+
+                # 모임 기록 삭제
+                await self._db.execute(
+                    "DELETE FROM meeting_history WHERE id = ?",
+                    (record["id"],)
+                )
+
+                # 게임 롤백 (완료 → 미플레이)
+                if game_app_id:
+                    await self._db.execute(
+                        """
+                        UPDATE wishlist SET status = '미플레이' 
+                        WHERE guild_id = ? AND app_id = ? AND status = '완료'
+                        """,
+                        (guild_id, game_app_id)
+                    )
+                
+                await self._db.commit()
+                return record
+            except Exception:
+                await self._db.rollback()
+                raise
