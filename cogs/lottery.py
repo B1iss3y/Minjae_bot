@@ -64,6 +64,12 @@ class LotteryCog(commands.Cog):
         if not session:
             await interaction.response.send_message("확정된 모임 세션이 없습니다.", ephemeral=True)
             return
+        if session.get("selected_game_app_id") is not None:
+            await interaction.response.send_message(
+                "이미 이번 모임의 게임이 선정되었습니다. 먼저 `플레이 완료`를 눌러주세요.",
+                ephemeral=True,
+            )
+            return
             
         attendees = await self.bot.db.get_attendees(session['id'])
         if not attendees:
@@ -130,9 +136,16 @@ class LotteryCog(commands.Cog):
         # 5. Weighted random selection
         selected_game = random.choices(games, weights=weights, k=1)[0]
         
-        # 6. Update game status + 세션에 게임 연결
-        await self.bot.db.update_game_status(guild_id, selected_game['app_id'], '진행 중')
-        await self.bot.db.set_session_game(session['id'], selected_game['app_id'])
+        # 6. 게임 상태와 세션 연결을 하나의 트랜잭션으로 확정한다.
+        claimed = await self.bot.db.claim_game_selection(
+            guild_id, session["id"], selected_game["app_id"]
+        )
+        if not claimed:
+            await interaction.response.send_message(
+                "게임을 선정할 수 없습니다. 이미 게임이 선정되었거나 상태가 변경되었습니다.",
+                ephemeral=True,
+            )
+            return
         
         # Find breakdown for selected game
         selected_breakdown = next(b for b in weight_breakdowns if b[0] == selected_game['app_id'])
@@ -172,6 +185,12 @@ class LotteryCog(commands.Cog):
                 ephemeral=True,
             )
             return
+        if session.get("selected_game_app_id") is not None:
+            await interaction.response.send_message(
+                "이미 이번 모임의 게임이 선정되었습니다. 먼저 `플레이 완료`를 눌러주세요.",
+                ephemeral=True,
+            )
+            return
 
         # 미플레이 게임 검색
         games = await self.bot.db.get_eligible_games(guild_id)
@@ -197,13 +216,16 @@ class LotteryCog(commands.Cog):
 
         selected_game = matches[0]
 
-        # 상태 변경 + 세션 연결
-        await self.bot.db.update_game_status(
-            guild_id, selected_game["app_id"], "진행 중"
+        # 상태 변경 + 세션 연결을 원자적으로 한 번만 수행한다.
+        claimed = await self.bot.db.claim_game_selection(
+            guild_id, session["id"], selected_game["app_id"]
         )
-        await self.bot.db.set_session_game(
-            session["id"], selected_game["app_id"]
-        )
+        if not claimed:
+            await interaction.response.send_message(
+                "게임을 선정할 수 없습니다. 이미 게임이 선정되었거나 상태가 변경되었습니다.",
+                ephemeral=True,
+            )
+            return
 
         # 임베드 카드
         embed = discord.Embed(

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 from typing import Optional
@@ -46,18 +47,45 @@ class GameSelectView(discord.ui.View):
         self.stop()
 
 class PaginatorView(discord.ui.View):
-    def __init__(self, items: list, title: str):
-        super().__init__(timeout=120)
+    def __init__(self, items: list, title: str, owner_id: int):
+        # 에페메럴 상호작용 토큰의 유효 시간(약 15분) 안에서 최대한 오래 유지한다.
+        super().__init__(timeout=840)
         self.items = items
         self.title = title
+        self.owner_id = owner_id
         self.current_page = 0
         self.per_page = 10
         self.max_page = math.ceil(len(items) / self.per_page)
+        self.message = None
+        self._page_lock = asyncio.Lock()
         self.update_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "이 목록을 연 사용자만 페이지를 이동할 수 있습니다.", ephemeral=True
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     def update_buttons(self):
         self.prev_button.disabled = self.current_page == 0
         self.next_button.disabled = self.current_page >= self.max_page - 1
+
+    def move_page(self, offset: int) -> None:
+        last_page = max(0, self.max_page - 1)
+        self.current_page = min(last_page, max(0, self.current_page + offset))
+        self.update_buttons()
 
     def generate_embed(self) -> discord.Embed:
         embed = discord.Embed(title=self.title, color=discord.Color.blue())
@@ -94,20 +122,26 @@ class PaginatorView(discord.ui.View):
             description += f"{status_emoji} **{title}** - {formatted_price}{added_at}\n"
 
         embed.description = description if description else "등록된 게임이 없습니다."
-        embed.set_footer(text=f"페이지 {self.current_page + 1} / max(1, {self.max_page})")
+        embed.set_footer(
+            text=f"페이지 {self.current_page + 1} / {max(1, self.max_page)}"
+        )
         return embed
 
     @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page -= 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.generate_embed(), view=self)
+        async with self._page_lock:
+            self.move_page(-1)
+            await interaction.response.edit_message(
+                embed=self.generate_embed(), view=self
+            )
 
     @discord.ui.button(label="다음", style=discord.ButtonStyle.secondary)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page += 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.generate_embed(), view=self)
+        async with self._page_lock:
+            self.move_page(1)
+            await interaction.response.edit_message(
+                embed=self.generate_embed(), view=self
+            )
 
 
 class Wishlist(commands.Cog):
@@ -234,8 +268,12 @@ class Wishlist(commands.Cog):
             return
 
         title_suffix = f" ({status_val})" if status_val else " (전체)"
-        view = PaginatorView(items, f"게임 위시리스트{title_suffix}")
-        await interaction.followup.send(embed=view.generate_embed(), view=view)
+        view = PaginatorView(
+            items, f"게임 위시리스트{title_suffix}", interaction.user.id
+        )
+        view.message = await interaction.followup.send(
+            embed=view.generate_embed(), view=view, ephemeral=True, wait=True
+        )
 
 
     @app_commands.command(name="게임상태변경", description="[관리자] 위시리스트의 게임 상태를 변경합니다.")
