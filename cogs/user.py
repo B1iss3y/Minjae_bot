@@ -62,6 +62,18 @@ class UserCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        if not self.bot.is_allowed_guild(member.guild.id):
+            return
+        try:
+            await self.bot.db.remove_guild_member(member.id, member.guild.id)
+        except Exception as exc:
+            print(
+                f"멤버 데이터 정리 실패 "
+                f"(guild={member.guild.id}, user={member.id}): {exc}"
+            )
+
     @app_commands.command(name="내정보등록", description="내 정보를 등록합니다.")
     async def register_info(self, interaction: discord.Interaction):
         view = UserRegisterView(self.bot)

@@ -261,6 +261,62 @@ class DatabaseManager:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
+    async def remove_guild_member(self, user_id: int, guild_id: int) -> None:
+        """서버를 떠난 멤버의 서버 범위 데이터를 정리한다."""
+
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                session_filter = "SELECT id FROM vote_sessions WHERE guild_id = ?"
+                for table in (
+                    "vote_responses",
+                    "attendance_responses",
+                    "session_attendees",
+                ):
+                    await self._db.execute(
+                        f"""
+                        DELETE FROM {table}
+                        WHERE user_id = ? AND session_id IN ({session_filter})
+                        """,
+                        (user_id, guild_id),
+                    )
+
+                await self._db.execute(
+                    "DELETE FROM users WHERE user_id = ? AND guild_id = ?",
+                    (user_id, guild_id),
+                )
+                await self._db.execute(
+                    """
+                    UPDATE wishlist SET added_by = NULL
+                    WHERE guild_id = ? AND added_by = ?
+                    """,
+                    (guild_id, user_id),
+                )
+
+                async with self._db.execute(
+                    "SELECT id, attendees FROM meeting_history WHERE guild_id = ?",
+                    (guild_id,),
+                ) as cur:
+                    history_rows = await cur.fetchall()
+                for row in history_rows:
+                    try:
+                        attendees = json.loads(row["attendees"] or "[]")
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    filtered = [
+                        item for item in attendees if str(item) != str(user_id)
+                    ]
+                    if filtered != attendees:
+                        await self._db.execute(
+                            "UPDATE meeting_history SET attendees = ? WHERE id = ?",
+                            (json.dumps(filtered), row["id"]),
+                        )
+
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+
     # ──────────────────────── Wishlist ────────────────────────
 
     async def add_wishlist_game(
@@ -637,13 +693,54 @@ class DatabaseManager:
                 raise
         return await self.get_vote_session(session_id)
 
-    async def set_session_game(self, session_id: int, app_id: int) -> None:
-        """세션에 선정된 게임 AppID를 기록한다."""
-        await self._db.execute(
-            "UPDATE vote_sessions SET selected_game_app_id = ? WHERE id = ?",
-            (app_id, session_id),
-        )
-        await self._db.commit()
+    async def claim_game_selection(
+        self, guild_id: int, session_id: int, app_id: int
+    ) -> bool:
+        """미선정 확정 세션에 게임을 정확히 한 번 연결한다."""
+
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                async with self._db.execute(
+                    """
+                    SELECT id FROM vote_sessions
+                    WHERE id = ? AND guild_id = ? AND status = '확정'
+                      AND selected_game_app_id IS NULL
+                    """,
+                    (session_id, guild_id),
+                ) as cur:
+                    if await cur.fetchone() is None:
+                        await self._db.rollback()
+                        return False
+
+                game_update = await self._db.execute(
+                    """
+                    UPDATE wishlist SET status = '진행 중'
+                    WHERE guild_id = ? AND app_id = ? AND status = '미플레이'
+                    """,
+                    (guild_id, app_id),
+                )
+                if game_update.rowcount != 1:
+                    await self._db.rollback()
+                    return False
+
+                session_update = await self._db.execute(
+                    """
+                    UPDATE vote_sessions SET selected_game_app_id = ?
+                    WHERE id = ? AND guild_id = ? AND status = '확정'
+                      AND selected_game_app_id IS NULL
+                    """,
+                    (app_id, session_id, guild_id),
+                )
+                if session_update.rowcount != 1:
+                    await self._db.rollback()
+                    return False
+
+                await self._db.commit()
+                return True
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def force_cancel_session(self, guild_id: int) -> dict | None:
         """활성 세션을 취소하고 연결된 게임 상태를 롤백한다.
@@ -899,7 +996,11 @@ class DatabaseManager:
                     "SELECT * FROM vote_sessions WHERE id = ?", (session_id,)
                 ) as cur:
                     row = await cur.fetchone()
-                if row is None or row["status"] != "확정":
+                if (
+                    row is None
+                    or row["status"] != "확정"
+                    or row["selected_game_app_id"] != game_app_id
+                ):
                     await self._db.rollback()
                     return None
 
@@ -1008,10 +1109,62 @@ class DatabaseManager:
                 record = dict(row)
                 game_app_id = record.get("game_app_id")
 
+                # 기록에 대응하는 완료 세션도 함께 제거해 내부 회차 중복을 막는다.
+                async with self._db.execute(
+                    """
+                    SELECT id FROM vote_sessions
+                    WHERE guild_id = ? AND session_number = ? AND status = '완료'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (guild_id, session_number),
+                ) as cur:
+                    completed_session = await cur.fetchone()
+                if completed_session:
+                    completed_session_id = completed_session["id"]
+                    for table in (
+                        "vote_responses",
+                        "attendance_responses",
+                        "session_attendees",
+                    ):
+                        await self._db.execute(
+                            f"DELETE FROM {table} WHERE session_id = ?",
+                            (completed_session_id,),
+                        )
+                    await self._db.execute(
+                        "DELETE FROM vote_sessions WHERE id = ?",
+                        (completed_session_id,),
+                    )
+
                 # 모임 기록 삭제
                 await self._db.execute(
                     "DELETE FROM meeting_history WHERE id = ?",
                     (record["id"],)
+                )
+
+                # 삭제한 회차 이후의 기록과 세션 번호를 함께 당긴다.
+                await self._db.execute(
+                    """
+                    UPDATE meeting_history
+                    SET session_number = session_number - 1
+                    WHERE guild_id = ? AND session_number > ?
+                    """,
+                    (guild_id, session_number),
+                )
+                await self._db.execute(
+                    """
+                    UPDATE vote_sessions
+                    SET session_number = session_number - 1
+                    WHERE guild_id = ? AND session_number > ?
+                    """,
+                    (guild_id, session_number),
+                )
+                await self._db.execute(
+                    """
+                    UPDATE server_config
+                    SET session_number = MAX(1, session_number - 1)
+                    WHERE guild_id = ? AND session_number > ?
+                    """,
+                    (guild_id, session_number),
                 )
 
                 # 게임 롤백 (완료 → 미플레이)
